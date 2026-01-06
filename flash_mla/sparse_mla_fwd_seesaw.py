@@ -155,8 +155,6 @@ def sparse_mla_fwd(
             m_i_prev_1 = T.alloc_fragment([H_per_block], accum_dtype)
             m_i_peer_1 = T.alloc_fragment([H_per_block], accum_dtype)
             
-            indices_local = T.alloc_fragment([1], indices_dtype)
-
             bar_q = T.alloc_barrier(arrive_count=384)
             
             # Producer -> Consumer Barriers
@@ -199,9 +197,17 @@ def sparse_mla_fwd(
             if tx >= 256:
 
                 # producer: prefetch kvcache to shared mem
-                # NOTE: 240/80 hangs because (256*240 + 128*80) = 71680 > 65536 (H100 SM RegFile Limit)
-                # 64 * 128 + 208 * 256 = 61440 < 64k = 65536
-                T.set_max_nreg(64, 0)
+                T.set_max_nreg(72, 0)
+                
+                prefetch_indices_0 = T.alloc_fragment([4], indices_dtype)
+                prefetch_indices_1 = T.alloc_fragment([4], indices_dtype)
+                
+                # Prime the Pump! 预读iter_0的索引
+                for r in T.serial(4):
+                    # 这里读取会产生long scoreboard stall，但是在循环开始之前只发生一次
+                    prefetch_indices_0[r] = Indices[b_i, s_i, g_i, r * 16 + (tx - 256) // 8]
+                    prefetch_indices_1[r] = Indices[b_i, s_i, g_i, BI + r * 16 + (tx - 256) // 8]
+
                 for i_i in T.serial(T.ceildiv(NI, 2)):
                     # Buffer 0
                     # 等待KV_shared_0_l和KV_shared_0_r都被使用完毕
@@ -211,12 +217,9 @@ def sparse_mla_fwd(
                     # 一个Block大小`BI`是64，加载过程被分为4次迭代，每次只处理16个indices
                     # producer一共有128个线程，8个连续线程一组协作加载一个index对应的kv
                     for r in T.serial(4):
-                        # TODO: 这里从global memory中获取index地址，并且立即需要这个地址用于
-                        # 判断is_kv_valid和获取kv数据，会造成long scoreboard stall，
-                        # 浪费等待几百个时钟周期，无法发射后续读取KV的指令
-                        indices_local[0] = Indices[b_i, s_i, g_i,
-                                                   (i_i * 2) * BI + r * 16 + (tx - 256) // 8]
-                        is_kv_valid[0, r * 16 + (tx - 256) // 8] = indices_local[0] <= max_kv_i
+                        # mitigate long scoreboard stall here
+                        index = prefetch_indices_0[r]
+                        is_kv_valid[0, r * 16 + (tx - 256) // 8] = index <= max_kv_i
                         if is_kv_valid[0, r * 16 + (tx - 256) // 8]:
                             # 这里假设dim = 512, tail_dim = 64
                             with T.attr("default", "async_scope", 1):
@@ -229,45 +232,53 @@ def sparse_mla_fwd(
                                         # (tx - 256) % 8决定了线程加载一行中的哪一部份
                                         KV_shared_0_l[r * 16 + (tx - 256) // 8,
                                                       64 * u + (tx - 256) % 8 * 8 +
-                                                      v] = KV[b_i, indices_local[0], g_i,
+                                                      v] = KV[b_i, index, g_i,
                                                               64 * u + (tx - 256) % 8 * 8 + v]
                                         KV_shared_0_r[r * 16 + (tx - 256) // 8,
                                                       64 * u + (tx - 256) % 8 * 8 +
-                                                      v] = KV[b_i, indices_local[0], g_i, D // 2 +
+                                                      v] = KV[b_i, index, g_i, D // 2 +
                                                               64 * u + (tx - 256) % 8 * 8 + v]
                             with T.attr("default", "async_scope", 1):
                                 # tail_dim(长度为64)只需8个线程一组协作一个iteration就能够加载完成
                                 for v in T.vectorized(8):
                                     K_tail_shared_0[r * 16 + (tx - 256) // 8, (tx - 256) % 8 * 8 +
-                                                    v] = KV[b_i, indices_local[0], g_i,
+                                                    v] = KV[b_i, index, g_i,
                                                             D + (tx - 256) % 8 * 8 + v]
                     T.cp_async_barrier_noinc(bar_k_0_ready[0])
+
+                    if i_i + 1 < T.ceildiv(NI, 2):
+                        # 为下一轮kv数据加载异步预取需要的索引，能够和本轮的kv数据加载实现重叠隐藏延迟
+                        for r in T.serial(4):
+                            prefetch_indices_0[r] = Indices[b_i, s_i, g_i, ((i_i + 1) * 2) * BI + r * 16 + (tx - 256) // 8]
 
                     # Buffer 1
                     T.barrier_wait(bar_k_1_free[0], (i_i & 1))
 
                     for r in T.serial(4):
-                        indices_local[0] = Indices[b_i, s_i, g_i,
-                                                   (i_i * 2 + 1) * BI + r * 16 + (tx - 256) // 8]
-                        is_kv_valid[1, r * 16 + (tx - 256) // 8] = indices_local[0] <= max_kv_i
+                        index = prefetch_indices_1[r]
+                        is_kv_valid[1, r * 16 + (tx - 256) // 8] = index <= max_kv_i
                         if is_kv_valid[1, r * 16 + (tx - 256) // 8]:
                             with T.attr("default", "async_scope", 1):
                                 for u in T.serial(4):
                                     for v in T.vectorized(8):
                                         KV_shared_1_l[r * 16 + (tx - 256) // 8,
                                                       64 * u + (tx - 256) % 8 * 8 +
-                                                      v] = KV[b_i, indices_local[0], g_i,
+                                                      v] = KV[b_i, index, g_i,
                                                               64 * u + (tx - 256) % 8 * 8 + v]
                                         KV_shared_1_r[r * 16 + (tx - 256) // 8,
                                                       64 * u + (tx - 256) % 8 * 8 +
-                                                      v] = KV[b_i, indices_local[0], g_i, D // 2 +
+                                                      v] = KV[b_i, index, g_i, D // 2 +
                                                               64 * u + (tx - 256) % 8 * 8 + v]
                             with T.attr("default", "async_scope", 1):
                                 for v in T.vectorized(8):
                                     K_tail_shared_1[r * 16 + (tx - 256) // 8, (tx - 256) % 8 * 8 +
-                                                    v] = KV[b_i, indices_local[0], g_i,
+                                                    v] = KV[b_i, index, g_i,
                                                             D + (tx - 256) % 8 * 8 + v]
                     T.cp_async_barrier_noinc(bar_k_1_ready[0])
+
+                    if i_i + 1 < T.ceildiv(NI, 2):
+                        for r in T.serial(4):
+                            prefetch_indices_1[r] = Indices[b_i, s_i, g_i, ((i_i + 1) * 2 + 1) * BI + r * 16 + (tx - 256) // 8]
 
             elif tx < 128:
                 # 检查是否已经有384个线程arrive过bar_q(phase0已经完成)，如果
@@ -280,8 +291,7 @@ def sparse_mla_fwd(
                 T.barrier_arrive(bar_k_1_free[0])
                 
                 # Consumer 0 (WG0): Responsible for Even Blocks and O_L (Left Half)
-                # NOTE: 240/80 hangs because (256*240 + 128*80) = 71680 > 65536 (H100 SM RegFile Limit)
-                T.set_max_nreg(208, 1)
+                T.set_max_nreg(216, 1)
                 T.fill(sumexp_0, 0)
                 for h_i in T.Parallel(H_per_block):
                     m_i_0[h_i] = -5e4
@@ -384,8 +394,9 @@ def sparse_mla_fwd(
                 T.barrier_arrive(bar_k_1_free[0])
 
                 # Consumer 1 (WG1): Responsible for Odd Blocks and O_R (Right Half)
-                # NOTE: 240/80 hangs because (256*240 + 128*80) = 71680 > 65536 (H100 SM RegFile Limit)
-                T.set_max_nreg(208, 1)
+                # NOTE: 256 * 216 + 128 * 72 = 64,512 < 65536(H100 SM RegFile Limit)，
+                # 设置的寄存器数量再多就会发生hang了，都必须是8的倍数
+                T.set_max_nreg(216, 1)
                 T.fill(sumexp_1, 0)
                 for h_i in T.Parallel(H_per_block):
                     m_i_1[h_i] = -5e4
@@ -595,7 +606,7 @@ def test_sparse_mla_fwd_pipelined(B=1,
     print("index generation finished")
 
     kernel = sparse_mla_fwd_interface(
-        q, kv, indices, q_start_s_index, KV_stride, return_kernel=True, print_kernel=False)
+        q, kv, indices, q_start_s_index, KV_stride, return_kernel=True, print_kernel=True)
 
     def fn():
         return kernel(q, kv, indices, q_start_s_index_t)
