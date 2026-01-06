@@ -211,6 +211,9 @@ def sparse_mla_fwd(
                     # 一个Block大小`BI`是64，加载过程被分为4次迭代，每次只处理16个indices
                     # producer一共有128个线程，8个连续线程一组协作加载一个index对应的kv
                     for r in T.serial(4):
+                        # TODO: 这里从global memory中获取index地址，并且立即需要这个地址用于
+                        # 判断is_kv_valid和获取kv数据，会造成long scoreboard stall，
+                        # 浪费等待几百个时钟周期，无法发射后续读取KV的指令
                         indices_local[0] = Indices[b_i, s_i, g_i,
                                                    (i_i * 2) * BI + r * 16 + (tx - 256) // 8]
                         is_kv_valid[0, r * 16 + (tx - 256) // 8] = indices_local[0] <= max_kv_i
