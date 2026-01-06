@@ -569,7 +569,8 @@ def test_sparse_mla_fwd_pipelined(B=1,
                                   dtype=torch.bfloat16,
                                   # query在全局序列位置中(或者说相对于kv)的偏移量
                                   q_start_s_index=2048,
-                                  check_correctness=True):
+                                  check_correctness=True,
+                                  profile=False):
     KV_stride = 1
 
     torch.random.manual_seed(0)
@@ -591,21 +592,28 @@ def test_sparse_mla_fwd_pipelined(B=1,
     print("index generation finished")
 
     kernel = sparse_mla_fwd_interface(
-        q, kv, indices, q_start_s_index, KV_stride, return_kernel=True, print_kernel=True)
+        q, kv, indices, q_start_s_index, KV_stride, return_kernel=True, print_kernel=False)
 
     def fn():
         return kernel(q, kv, indices, q_start_s_index_t)
 
-    tl_out, tl_lse = fn()
-    assert KV_stride == 1, "KV_stride > 1 not supported"
-    # if q_start_s_index == 0 and KV_stride > 1:
-    #     tl_out[:, :KV_stride - 1, :, :] = 0
-    
     if check_correctness:
+        tl_out, tl_lse = fn()
+        assert KV_stride == 1, "KV_stride > 1 not supported"
+        # if q_start_s_index == 0 and KV_stride > 1:
+        #     tl_out[:, :KV_stride - 1, :, :] = 0
         ref_out = ref_sparse_mla_fwd_interface(q, kv, indices, q_start_s_index, KV_stride)
         print(f"tl_out: {tl_out}")
         print(f"ref_out: {ref_out}")
         torch.testing.assert_close(tl_out, ref_out, rtol=1e-3, atol=1e-3)
+
+    if profile:
+        print("Profiling mode: running minimal iterations (1 warmup + 1 run)...")
+        fn()
+        torch.cuda.synchronize()
+        fn()
+        torch.cuda.synchronize()
+        return
 
     from tilelang.profiler import do_bench
     ms = do_bench(
@@ -622,21 +630,22 @@ def test_sparse_mla_fwd_pipelined(B=1,
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--test_correctness", action="store_true")
+    parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()
     if args.test_correctness:
         B, S, SKV, H, HKV, DQK, DV, topk, dtype = 1, 1024, 8192, 128, 1, 576, 512, 2048, torch.bfloat16
         test_sparse_mla_fwd_pipelined(
-            B, S, SKV, H, HKV, DQK, DV, topk, dtype, check_correctness=True)
+            B, S, SKV, H, HKV, DQK, DV, topk, dtype, check_correctness=True, profile=args.profile)
     else:
         # Prefill Benchmark: long context
         print(" --- Prefill Benchmark --- ")
         B, S, SKV, H, HKV, DQK, DV, topk, dtype = 2, 4096, 8192, 128, 1, 576, 512, 2048, torch.bfloat16
         test_sparse_mla_fwd_pipelined(
-            B, S, SKV, H, HKV, DQK, DV, topk, dtype, q_start_s_index=4096, check_correctness=False)
+            B, S, SKV, H, HKV, DQK, DV, topk, dtype, q_start_s_index=4096, check_correctness=False, profile=args.profile)
 
         # Decode Benchmark: large batch size, high throughput generation
         print("\n --- Decode Benchmark --- ")
         # Increase batch size to saturate h100 for decode
         B, S, SKV, H, HKV, DQK, DV, topk, dtype = 128 * 16, 2, 8192, 128, 1, 576, 512, 2048, torch.bfloat16
         test_sparse_mla_fwd_pipelined(
-            B, S, SKV, H, HKV, DQK, DV, topk, dtype, q_start_s_index=2048 + 4096, check_correctness=False)
+            B, S, SKV, H, HKV, DQK, DV, topk, dtype, q_start_s_index=2048 + 4096, check_correctness=False, profile=args.profile)
