@@ -82,6 +82,14 @@ def sparse_mla_fwd(
 
     # 从32->64能够减少用于读kvcache所花的时间，如果num_query_head = 128,
     # num_kv_head = 1, 原本同样的kvcache需要读4次，改变之后只需要读2次了
+    # TODO: 当H_per_block = 64, num_query_head = 128时，有两个
+    # thread block会读取相同的kvcache，能不能将两次hbm读取优化成只读
+    # 一次，比如说读到L2 cache中然后boardcast到两个thread block的shared
+    # memory中，或者说使用thread block cluster功能，相同的kvcache
+    # 只需要从hbm中读一次就能够读到cluster中所有thread block的shared mem中,
+    # 最重要的是能够将两个hbm读减少至一次，这会极大提升io throughput(tb/s)和tflops/s
+
+    # NOTE: tilelang中有T.call_extern和T.ptx
     H_per_block = padded_H if REPLICATE_H == 1 else 64
 
     @T.prim_func
@@ -306,16 +314,16 @@ def sparse_mla_fwd(
                     T.gemm(Q_shared_l, KV_shared_0_l, acc_s_0, transpose_B=True, wg_wait=-1)
                     T.gemm(Q_shared_r, KV_shared_0_r, acc_s_0, transpose_B=True, wg_wait=-1)
                     T.gemm(Q_tail_shared, K_tail_shared_0, acc_s_0, transpose_B=True, wg_wait=-1)
+
+                    T.copy(m_i_0, m_i_prev_0)
                     T.wait_wgmma(0)
 
                     for h_i, bi_i in T.Parallel(H_per_block, BI):
                         if not is_kv_valid[0, bi_i]:
                             acc_s_0[h_i, bi_i] = -5e4
+                    T.reduce_max(acc_s_0, m_i_0, dim=1, clear=False)
 
                     # --- Step 2: Local Softmax Stats & Exchange ---
-                    T.copy(m_i_0, m_i_prev_0)
-                    T.reduce_max(acc_s_0, m_i_0, dim=1, clear=False)
-                    
                     T.copy(m_i_0, row_max_shared_0)
                     T.barrier_arrive(bar_stats_0_ready)
                     # 如果consumer0在iter_i等待到了consumer1传递过来的
@@ -419,15 +427,10 @@ def sparse_mla_fwd(
                         if not is_kv_valid[1, bi_i]:
                             acc_s_1[h_i, bi_i] = -5e4
                     
-                    T.copy(acc_s_1, S_shared_1)
-                    
                     T.reduce_max(acc_s_1, m_i_1, dim=1, clear=False)
-                    
                     T.copy(m_i_1, row_max_shared_1)
-                    
                     T.barrier_arrive(bar_stats_1_ready)
                     T.barrier_wait(bar_stats_0_ready, (i_i & 1))
-
                     T.copy(row_max_shared_0, m_i_peer_1)
                     
                     for h_i in T.Parallel(H_per_block):

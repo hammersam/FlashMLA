@@ -10,3 +10,8 @@ compile_commands.json
 .cache
 /dev
 /.clangd
+*.ncu-rep
+*.sqlite
+*.nsys-rep
+flash_mla/sparse_mla_fwd_pipelined_ref.py
+.vscode-ctags
