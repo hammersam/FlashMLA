@@ -306,16 +306,16 @@ def sparse_mla_fwd(
                     T.gemm(Q_shared_l, KV_shared_0_l, acc_s_0, transpose_B=True, wg_wait=-1)
                     T.gemm(Q_shared_r, KV_shared_0_r, acc_s_0, transpose_B=True, wg_wait=-1)
                     T.gemm(Q_tail_shared, K_tail_shared_0, acc_s_0, transpose_B=True, wg_wait=-1)
+
+                    T.copy(m_i_0, m_i_prev_0)
                     T.wait_wgmma(0)
 
                     for h_i, bi_i in T.Parallel(H_per_block, BI):
                         if not is_kv_valid[0, bi_i]:
                             acc_s_0[h_i, bi_i] = -5e4
+                    T.reduce_max(acc_s_0, m_i_0, dim=1, clear=False)
 
                     # --- Step 2: Local Softmax Stats & Exchange ---
-                    T.copy(m_i_0, m_i_prev_0)
-                    T.reduce_max(acc_s_0, m_i_0, dim=1, clear=False)
-                    
                     T.copy(m_i_0, row_max_shared_0)
                     T.barrier_arrive(bar_stats_0_ready)
                     # 如果consumer0在iter_i等待到了consumer1传递过来的
@@ -419,15 +419,10 @@ def sparse_mla_fwd(
                         if not is_kv_valid[1, bi_i]:
                             acc_s_1[h_i, bi_i] = -5e4
                     
-                    T.copy(acc_s_1, S_shared_1)
-                    
                     T.reduce_max(acc_s_1, m_i_1, dim=1, clear=False)
-                    
                     T.copy(m_i_1, row_max_shared_1)
-                    
                     T.barrier_arrive(bar_stats_1_ready)
                     T.barrier_wait(bar_stats_0_ready, (i_i & 1))
-
                     T.copy(row_max_shared_0, m_i_peer_1)
                     
                     for h_i in T.Parallel(H_per_block):
